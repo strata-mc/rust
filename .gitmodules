@@ -41,8 +41,9 @@
 	shallow = true
 [submodule "src/tools/enzyme"]
 	path = src/tools/enzyme
-	url = https://github.com/rust-lang/enzyme.git
+	url = git@github.com:strata-mc/enzyme.git
 	shallow = true
+	branch = strata/main
 [submodule "src/gcc"]
 	path = src/gcc
 	url = https://github.com/rust-lang/gcc.git
