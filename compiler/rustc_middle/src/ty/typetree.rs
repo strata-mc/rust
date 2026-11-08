@@ -122,16 +122,44 @@ fn typetree_from_ty_impl_inner<'tcx>(
         }
         ty::Ref(..) | ty::RawPtr(..) => handle_indirection(ty, tcx, depth, visited),
         ty::Adt(def, _) if def.is_box() => handle_indirection(ty, tcx, depth, visited),
+        // Strata patch: a Vec's buffer pointer is type-erased (`NonNull<u8>`), so describe it
+        // directly: a pointer to elements of T, plus integer length and capacity.
+        ty::Adt(def, args) if tcx.is_diagnostic_item(rustc_span::sym::Vec, def.did()) => {
+            vec_typetree(tcx, ty, args.type_at(0), depth, visited)
+        }
         ty::Array(element_ty, len_const) => {
-            let len = len_const.try_to_target_usize(tcx).unwrap_or(0);
+            // Strata patch: a length written as a named constant may still be unevaluated here;
+            // fall back to the array's size over its element's size.
+            let typing_env = ty::TypingEnv::fully_monomorphized();
+            let len = len_const.try_to_target_usize(tcx).unwrap_or_else(|| {
+                let whole = tcx.layout_of(typing_env.as_query_input(ty)).map(|l| l.size.bytes()).unwrap_or(0);
+                let one = tcx.layout_of(typing_env.as_query_input(*element_ty)).map(|l| l.size.bytes()).unwrap_or(0);
+                if one > 0 { whole / one } else { 0 }
+            });
             if len == 0 {
                 TypeTree::new()
             } else {
                 let element_tree =
                     typetree_from_ty_impl_inner(tcx, *element_ty, depth + 1, visited, false);
                 let mut types = Vec::new();
-                for elem_type in &element_tree.0 {
-                    types.push(Type::from_ty(-1, elem_type));
+                // Strata patch: offset -1 means "every element" only where the array is itself the
+                // pointee; inside a struct the caller turns it into the field's offset, typing just
+                // element 0. Spell out each element (bounded) so struct fields are fully typed.
+                let elem_size = tcx
+                    .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(*element_ty))
+                    .map(|l| l.size.bytes_usize())
+                    .unwrap_or(0);
+                if elem_size > 0 && len as usize * element_tree.0.len() <= 4096 {
+                    for i in 0..len as usize {
+                        for elem_type in &element_tree.0 {
+                            let off = if elem_type.offset == -1 { 0 } else { elem_type.offset };
+                            types.push(Type::from_ty((i * elem_size) as isize + off, elem_type));
+                        }
+                    }
+                } else {
+                    for elem_type in &element_tree.0 {
+                        types.push(Type::from_ty(-1, elem_type));
+                    }
                 }
 
                 TypeTree(types)
@@ -225,4 +253,39 @@ fn typetree_from_ty_impl_inner<'tcx>(
     let popped = visited.pop();
     debug_assert_eq!(popped, Some(ty));
     tree
+}
+
+/// Byte offset of a (possibly nested) field reached by following field names from `ty`.
+fn field_path_offset<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>, path: &[&str]) -> Option<usize> {
+    let mut offset = 0;
+    for name in path {
+        let ty::Adt(def, args) = ty.kind() else { return None };
+        let variant = def.non_enum_variant();
+        let (idx, field) = variant.fields.iter().enumerate().find(|(_, f)| f.name.as_str() == *name)?;
+        let layout = tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty)).ok()?;
+        offset += layout.fields.offset(idx).bytes_usize();
+        ty = field.ty(tcx, *args).skip_norm_wip();
+    }
+    Some(offset)
+}
+
+fn vec_typetree<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    vec_ty: Ty<'tcx>,
+    elem_ty: Ty<'tcx>,
+    depth: usize,
+    visited: &mut Vec<Ty<'tcx>>,
+) -> TypeTree {
+    let ptr = field_path_offset(tcx, vec_ty, &["buf", "inner", "ptr"]);
+    let len = field_path_offset(tcx, vec_ty, &["len"]);
+    let cap = field_path_offset(tcx, vec_ty, &["buf", "inner", "cap"]);
+    let (Some(ptr), Some(len), Some(cap)) = (ptr, len, cap) else { return TypeTree::new() };
+    let usize_size = tcx.data_layout.pointer_size().bytes_usize();
+    // `false`: element types at offset -1 apply to every element, as for arrays and slices
+    let child = typetree_from_ty_impl_inner(tcx, elem_ty, depth + 1, visited, false);
+    let mut types = vec![Type { offset: ptr as isize, size: usize_size, kind: Kind::Pointer, child }];
+    for off in [len, cap] {
+        types.push(Type { offset: off as isize, size: usize_size, kind: Kind::Integer, child: TypeTree::new() });
+    }
+    TypeTree(types)
 }
